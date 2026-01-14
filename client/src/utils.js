@@ -12,6 +12,7 @@ export const todayIso = () => new Date().toISOString().slice(0,10);
 
 export function statusLabel(s) {
   if (s === 'paid') return { text: 'Pago', cls: 'bg-emerald-500/15 text-emerald-200 border-emerald-400/20' };
+  if (s === 'bill_overdue') return { text: 'Boleto atrasado', cls: 'bg-orange-500/15 text-orange-200 border-orange-400/20' };
   if (s === 'overdue') return { text: 'Atrasado', cls: 'bg-rose-500/15 text-rose-200 border-rose-400/20' };
   return { text: 'Pendente', cls: 'bg-amber-500/15 text-amber-200 border-amber-400/20' };
 }

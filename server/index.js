@@ -130,6 +130,8 @@ async function initDb() {
       value REAL NOT NULL,
       due_date TEXT NOT NULL,
       status TEXT NOT NULL CHECK(status IN ('paid','pending','overdue')),
+      -- Quando marcado, indica que o cliente está com boleto atrasado (não é atraso de comissão da empresa)
+      bill_overdue INTEGER NOT NULL DEFAULT 0,
       paid_date TEXT,
       FOREIGN KEY (sale_id) REFERENCES sales(id) ON DELETE CASCADE
     );
@@ -150,6 +152,19 @@ async function initDb() {
       UPDATE sales SET updated_at = datetime('now') WHERE id = OLD.id;
     END;
   `);
+
+  // ---- Migrations (idempotent)
+  // Older DBs may not have the new installments.bill_overdue column.
+  try {
+    const cols = await db.all(`PRAGMA table_info(installments)`);
+    const hasBillOverdue = cols.some(c => c.name === 'bill_overdue');
+    if (!hasBillOverdue) {
+      await db.exec(`ALTER TABLE installments ADD COLUMN bill_overdue INTEGER NOT NULL DEFAULT 0;`);
+      console.log('🧩 Migração: adicionada coluna installments.bill_overdue');
+    }
+  } catch (e) {
+    console.warn('⚠️ Não foi possível rodar migrações de installments (PRAGMA/ALTER).', e?.message || e);
+  }
 
   // Ensure admin user
   const admin = await db.get('SELECT id FROM users WHERE username=?', [ADMIN_USER]);
@@ -253,6 +268,7 @@ async function upsertInstallments(saleId, totalCommission, saleDate, providedIns
       value: per,
       due_date: addMonths(saleDate, i + 1),
       status: 'pending',
+      bill_overdue: 0,
       paid_date: null
     }));
     // adjust rounding on last
@@ -265,6 +281,7 @@ async function upsertInstallments(saleId, totalCommission, saleDate, providedIns
       value: Number(it.value ?? 0),
       due_date: String(it.due_date),
       status: it.status === 'paid' || it.status === 'overdue' ? it.status : 'pending',
+      bill_overdue: Number(it.bill_overdue || 0) ? 1 : 0,
       paid_date: it.paid_date ? String(it.paid_date) : null
     }));
   }
@@ -272,8 +289,8 @@ async function upsertInstallments(saleId, totalCommission, saleDate, providedIns
   await db.run('DELETE FROM installments WHERE sale_id=?', [saleId]);
   for (const it of installments) {
     await db.run(
-      'INSERT INTO installments(sale_id, number, value, due_date, status, paid_date) VALUES(?,?,?,?,?,?)',
-      [saleId, it.number, it.value, it.due_date, it.status, it.paid_date]
+      'INSERT INTO installments(sale_id, number, value, due_date, status, bill_overdue, paid_date) VALUES(?,?,?,?,?,?,?)',
+      [saleId, it.number, it.value, it.due_date, it.status, it.bill_overdue ? 1 : 0, it.paid_date]
     );
   }
 }
@@ -447,6 +464,7 @@ app.get('/api/sales', auth(), async (req, res) => {
       value: it.value,
       due_date: it.due_date,
       status: it.status,
+      bill_overdue: Number(it.bill_overdue || 0) ? 1 : 0,
       paid_date: it.paid_date
     });
     bySale.set(it.sale_id, arr);
@@ -555,7 +573,7 @@ app.post('/api/sales', auth(), async (req, res) => {
 
   await upsertInstallments(r.lastID, total_commission, String(body.sale_date), body.installments);
   const created = await db.get('SELECT * FROM sales WHERE id=?', [r.lastID]);
-  const its = await db.all('SELECT number,value,due_date,status,paid_date FROM installments WHERE sale_id=? ORDER BY number', [r.lastID]);
+  const its = await db.all('SELECT number,value,due_date,status,bill_overdue,paid_date FROM installments WHERE sale_id=? ORDER BY number', [r.lastID]);
   res.json({ ...created, insurance: !!created.insurance, quotas_values: quotasValuesFinal, installments: its });
 });
 
@@ -608,7 +626,7 @@ app.put('/api/sales/:id', auth(), async (req, res) => {
   const updated = await db.get('SELECT * FROM sales WHERE id=?', [saleId]);
   await ensureLegacyQuotasForSale(updated);
   const qs = await db.all('SELECT number,value FROM sale_quotas WHERE sale_id=? ORDER BY number', [saleId]);
-  const its = await db.all('SELECT number,value,due_date,status,paid_date FROM installments WHERE sale_id=? ORDER BY number', [saleId]);
+  const its = await db.all('SELECT number,value,due_date,status,bill_overdue,paid_date FROM installments WHERE sale_id=? ORDER BY number', [saleId]);
   res.json({ ...updated, insurance: !!updated.insurance, quotas_values: qs.map(x => x.value), installments: its });
 });
 
@@ -644,7 +662,7 @@ app.put('/api/sales/:id/quotas', auth(), async (req, res) => {
   await upsertQuotas(saleId, quotas_values);
 
   // Keep installments coherent by scaling values to match the new total commission.
-  const currentIts = await db.all('SELECT number,value,due_date,status,paid_date FROM installments WHERE sale_id=? ORDER BY number', [saleId]);
+  const currentIts = await db.all('SELECT number,value,due_date,status,bill_overdue,paid_date FROM installments WHERE sale_id=? ORDER BY number', [saleId]);
   if (currentIts.length) {
     const oldTotal = Number(existing.total_commission || 0);
     const factor = oldTotal > 0 ? (new_total_commission / oldTotal) : 1;
@@ -653,6 +671,7 @@ app.put('/api/sales/:id/quotas', auth(), async (req, res) => {
       value: Math.round((Number(it.value || 0) * factor) * 100) / 100,
       due_date: String(it.due_date),
       status: it.status,
+      bill_overdue: Number(it.bill_overdue || 0) ? 1 : 0,
       paid_date: it.paid_date
     }));
     // rounding fix on last installment
@@ -670,7 +689,7 @@ app.put('/api/sales/:id/quotas', auth(), async (req, res) => {
   );
 
   const updated = await db.get('SELECT * FROM sales WHERE id=?', [saleId]);
-  const its = await db.all('SELECT number,value,due_date,status,paid_date FROM installments WHERE sale_id=? ORDER BY number', [saleId]);
+  const its = await db.all('SELECT number,value,due_date,status,bill_overdue,paid_date FROM installments WHERE sale_id=? ORDER BY number', [saleId]);
   res.json({
     ...updated,
     insurance: !!updated.insurance,
@@ -692,7 +711,7 @@ app.put('/api/sales/:id/installments', auth(), async (req, res) => {
   if (!Array.isArray(installments)) return res.status(400).json({ error: 'missing_installments' });
 
   await upsertInstallments(saleId, existing.total_commission, existing.sale_date, installments);
-  const its = await db.all('SELECT number,value,due_date,status,paid_date FROM installments WHERE sale_id=? ORDER BY number', [saleId]);
+  const its = await db.all('SELECT number,value,due_date,status,bill_overdue,paid_date FROM installments WHERE sale_id=? ORDER BY number', [saleId]);
   res.json({ ok: true, installments: its });
 });
 
@@ -826,6 +845,7 @@ app.get('/api/recebimentos', auth(), async (req, res) => {
         i.value,
         i.due_date,
         i.status,
+        i.bill_overdue,
         i.paid_date,
         s.sale_date,
         s.client_name,
@@ -838,7 +858,14 @@ app.get('/api/recebimentos', auth(), async (req, res) => {
     params
   );
 
-  const total = rows.reduce((acc, x) => acc + Number(x.value || 0), 0);
+  const total = rows.reduce((acc, x) => {
+    const value = Number(x.value || 0);
+    const billOverdue = Number(x.bill_overdue || 0) ? 1 : 0;
+    const isPaid = String(x.status || '') === 'paid' || !!x.paid_date;
+    // Se está marcado como "boleto atrasado" e NÃO está pago, não soma no total do mês
+    if (billOverdue && !isPaid) return acc;
+    return acc + value;
+  }, 0);
 
   res.json({
     month,
@@ -851,6 +878,7 @@ app.get('/api/recebimentos', auth(), async (req, res) => {
       value: Number(x.value),
       due_date: x.due_date,
       status: x.status,
+      bill_overdue: Number(x.bill_overdue || 0) ? 1 : 0,
       paid_date: x.paid_date,
       sale_date: x.sale_date,
       client_name: x.client_name,
@@ -929,10 +957,11 @@ app.get('/api/export/xlsx', auth(), async (req, res) => {
     { header: 'Valor (R$)', key: 'value', width: 14 },
     { header: 'Vencimento', key: 'due_date', width: 12 },
     { header: 'Status', key: 'status', width: 10 },
+    { header: 'Boleto atrasado', key: 'bill_overdue', width: 15 },
     { header: 'Pago em', key: 'paid_date', width: 12 }
   ];
   ws2.getRow(1).font = { bold: true };
-  ws2.autoFilter = `A1:J1`;
+  ws2.autoFilter = `A1:K1`;
 
   instRows.forEach(r => ws2.addRow(r));
   ws2.getColumn('G').numFmt = '"R$" #,##0.00';

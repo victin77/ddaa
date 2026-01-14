@@ -302,6 +302,7 @@ function isOverdue(due_date) {
 function normalizeInstallmentForUi(it) {
   // status "overdue" automático no front se estiver pendente e vencido
   const paid = it.status === 'paid' || !!it.paid_date;
+  const billOverdue = Number(it.bill_overdue || 0) ? 1 : 0;
   const overdueAuto = !paid && isOverdue(it.due_date);
   const status = paid ? 'paid' : (overdueAuto ? 'overdue' : 'pending');
   return {
@@ -309,8 +310,15 @@ function normalizeInstallmentForUi(it) {
     value: Number(it.value || 0),
     due_date: String(it.due_date),
     status,
+    bill_overdue: billOverdue,
     paid_date: it.paid_date ? String(it.paid_date) : null
   };
+}
+
+function displayInstallmentStatus(it) {
+  if (it.status === 'paid' || it.paid_date) return 'paid';
+  if (Number(it.bill_overdue || 0)) return 'bill_overdue';
+  return it.status || 'pending';
 }
 
 export default function Dashboard({ user, onLogout }) {
@@ -594,10 +602,15 @@ export default function Dashboard({ user, onLogout }) {
       if (it.number !== number) return it;
 
       if (newUiStatus === 'paid') {
-        return { ...it, status: 'paid', paid_date: todayIso() };
+        return { ...it, status: 'paid', bill_overdue: 0, paid_date: todayIso() };
+      }
+      if (newUiStatus === 'bill_overdue') {
+        // boleto atrasado (cliente não pagou) — mantém como pendente para regras automáticas,
+        // mas marca a flag para exibir corretamente.
+        return { ...it, status: 'pending', bill_overdue: 1, paid_date: null };
       }
       // pending: se está vencida, vai aparecer como atrasada automaticamente (normalize)
-      return { ...it, status: 'pending', paid_date: null };
+      return { ...it, status: 'pending', bill_overdue: 0, paid_date: null };
     }));
   };
 
@@ -616,6 +629,7 @@ export default function Dashboard({ user, onLogout }) {
           value: it.value,
           due_date: it.due_date,
           status: paid ? 'paid' : (overdue ? 'overdue' : 'pending'),
+          bill_overdue: paid ? 0 : (Number(it.bill_overdue || 0) ? 1 : 0),
           paid_date: paid ? (it.paid_date || todayIso()) : null
         };
       });
@@ -828,7 +842,8 @@ export default function Dashboard({ user, onLogout }) {
                       </thead>
                       <tbody>
                         {(cashflow?.installments || []).map((it) => {
-                          const sl = statusLabel(it.status);
+                          const dispStatus = (it.status === 'paid' || it.paid_date) ? 'paid' : (Number(it.bill_overdue || 0) ? 'bill_overdue' : (it.status || 'pending'));
+                          const sl = statusLabel(dispStatus);
                           return (
                             <tr key={`${it.sale_id}-${it.installment_number}`} className="border-t border-slate-200/60 dark:border-white/10">
                               <td className="py-2 pr-4 whitespace-nowrap">{fmtDate(it.due_date)}</td>
@@ -1001,8 +1016,10 @@ export default function Dashboard({ user, onLogout }) {
 
                   <div className="divide-y divide-slate-200/60 dark:divide-white/10">
                     {(editingInstallments || []).map((it) => {
-                      const st = statusLabel(it.status);
-                      const isPaid = it.status === 'paid';
+                      const dispStatus = displayInstallmentStatus(it);
+                      const st = statusLabel(dispStatus);
+                      const isPaid = dispStatus === 'paid';
+                      const isBillOverdue = dispStatus === 'bill_overdue';
                       const isAutoOverdue = it.status === 'overdue' && !it.paid_date;
 
                       return (
@@ -1015,12 +1032,15 @@ export default function Dashboard({ user, onLogout }) {
                             <span className={`text-xs px-3 py-1 rounded-full border ${st.cls}`}>{st.text}</span>
 
                             <select
-                              value={isPaid ? 'paid' : 'pending'}
+                              value={isPaid ? 'paid' : (isBillOverdue ? 'bill_overdue' : 'pending')}
                               onChange={(e) => setInstallmentUiStatus(it.number, e.target.value)}
                               className="rounded-2xl bg-slate-50 dark:bg-white/5 border border-slate-200 dark:border-white/10 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-500/40"
-                              title={isAutoOverdue ? 'Está atrasada automaticamente (vencida e não paga).' : 'Alterar status'}
+                              title={isBillOverdue
+                                ? 'Cliente está com boleto atrasado.'
+                                : (isAutoOverdue ? 'Está atrasada automaticamente (vencida e não paga).' : 'Alterar status')}
                             >
                               <option value="pending">Pendente</option>
+                              <option value="bill_overdue">Boleto atrasado</option>
                               <option value="paid">Paga</option>
                             </select>
 
@@ -1195,7 +1215,16 @@ function SalesView({ sales, isAdmin, onNew, onDetails }) {
                   className="cursor-pointer hover:bg-slate-100/70 dark:hover:bg-white/5"
                 >
                   <td className="px-4 py-3 whitespace-nowrap">{fmtDate(s.sale_date)}</td>
-                  <td className="px-4 py-3">{s.client_name}</td>
+                  <td className="px-4 py-3">
+                    <div className="flex items-center gap-2">
+                      <span>{s.client_name}</span>
+                      {Array.isArray(s.installments) && s.installments.some(it => Number(it.bill_overdue || 0) === 1 && !it.paid_date && String(it.status || '') !== 'paid') && (
+                        <span className="inline-flex items-center px-2 py-1 rounded-full text-[11px] font-semibold bg-amber-500/15 text-amber-700 dark:text-amber-300 border border-amber-500/25">
+                          Boleto atrasado
+                        </span>
+                      )}
+                    </div>
+                  </td>
                   {isAdmin && <td className="px-4 py-3">{s.consultant_name}</td>}
                   <td className="px-4 py-3">{s.product}</td>
                   <td className="px-4 py-3 text-slate-600 dark:text-slate-300">
