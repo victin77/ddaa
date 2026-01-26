@@ -686,6 +686,10 @@ app.put('/api/sales/:id', auth(), async (req, res) => {
   const commission_percentage = body.commission_percentage !== undefined ? Number(body.commission_percentage) : existing.commission_percentage;
   const total_commission = calcTotalCommission(base_value, commission_percentage);
 
+  const oldTotalCommission = Number(existing.total_commission || 0);
+  const hasInstallmentsPayload = Array.isArray(body.installments);
+  const shouldAutoUpdateInstallments = !hasInstallmentsPayload && Math.abs(total_commission - oldTotalCommission) >= 0.005;
+
   await db.run(
     `UPDATE sales SET
       client_number=?, client_name=?, product=?, sale_date=?, insurance=?,
@@ -709,8 +713,53 @@ app.put('/api/sales/:id', auth(), async (req, res) => {
     ]
   );
 
-  if (body.installments) {
+  if (hasInstallmentsPayload) {
     await upsertInstallments(saleId, total_commission, body.sale_date ?? existing.sale_date, body.installments);
+  }
+
+  // If the sale total commission changed and installments weren't explicitly provided,
+  // automatically rescale existing installments to match the new total_commission.
+  if (shouldAutoUpdateInstallments) {
+    const currentIts = await db.all(
+      'SELECT number,value,due_date,status,bill_overdue,paid_date FROM installments WHERE sale_id=? ORDER BY number',
+      [saleId]
+    );
+
+    if (currentIts.length) {
+      const factor = oldTotalCommission > 0 ? (total_commission / oldTotalCommission) : null;
+      let scaled = currentIts.map((it) => ({
+        number: Number(it.number),
+        value: Math.round(((Number(it.value || 0) * (factor ?? 0)) || 0) * 100) / 100,
+        due_date: String(it.due_date),
+        status: it.status,
+        bill_overdue: Number(it.bill_overdue || 0) ? 1 : 0,
+        paid_date: it.paid_date ? String(it.paid_date) : null
+      }));
+
+      if (!factor) {
+        const n = scaled.length || 1;
+        const per = Math.round((total_commission / n) * 100) / 100;
+        scaled = scaled.map((it) => ({ ...it, value: per }));
+      }
+
+      const sum = scaled.reduce((a, x) => a + Number(x.value || 0), 0);
+      let diff = Math.round((total_commission - sum) * 100) / 100;
+      for (let i = scaled.length - 1; i >= 0 && diff !== 0; i--) {
+        const cur = Number(scaled[i].value || 0);
+        const next = Math.round((cur + diff) * 100) / 100;
+        if (next >= 0) {
+          scaled[i].value = next;
+          diff = 0;
+        } else {
+          scaled[i].value = 0;
+          diff = Math.round((diff + cur) * 100) / 100;
+        }
+      }
+
+      await upsertInstallments(saleId, total_commission, body.sale_date ?? existing.sale_date, scaled);
+    } else {
+      await upsertInstallments(saleId, total_commission, body.sale_date ?? existing.sale_date, null);
+    }
   }
 
   const updated = await db.get('SELECT * FROM sales WHERE id=?', [saleId]);
