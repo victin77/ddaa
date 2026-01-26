@@ -688,7 +688,11 @@ app.put('/api/sales/:id', auth(), async (req, res) => {
 
   const oldTotalCommission = Number(existing.total_commission || 0);
   const hasInstallmentsPayload = Array.isArray(body.installments);
-  const shouldAutoUpdateInstallments = !hasInstallmentsPayload && Math.abs(total_commission - oldTotalCommission) >= 0.005;
+  const oldSaleDate = String(existing.sale_date);
+  const nextSaleDate = body.sale_date !== undefined ? String(body.sale_date) : oldSaleDate;
+  const saleDateChanged = body.sale_date !== undefined && String(body.sale_date) !== oldSaleDate;
+  const commissionChanged = Math.abs(total_commission - oldTotalCommission) >= 0.005;
+  const shouldAutoUpdateInstallments = !hasInstallmentsPayload && (commissionChanged || saleDateChanged);
 
   await db.run(
     `UPDATE sales SET
@@ -730,7 +734,7 @@ app.put('/api/sales/:id', auth(), async (req, res) => {
       let scaled = currentIts.map((it) => ({
         number: Number(it.number),
         value: Math.round(((Number(it.value || 0) * (factor ?? 0)) || 0) * 100) / 100,
-        due_date: String(it.due_date),
+        due_date: saleDateChanged ? addMonths(nextSaleDate, Number(it.number)) : String(it.due_date),
         status: it.status,
         bill_overdue: Number(it.bill_overdue || 0) ? 1 : 0,
         paid_date: it.paid_date ? String(it.paid_date) : null
@@ -756,9 +760,9 @@ app.put('/api/sales/:id', auth(), async (req, res) => {
         }
       }
 
-      await upsertInstallments(saleId, total_commission, body.sale_date ?? existing.sale_date, scaled);
+      await upsertInstallments(saleId, total_commission, nextSaleDate, scaled);
     } else {
-      await upsertInstallments(saleId, total_commission, body.sale_date ?? existing.sale_date, null);
+      await upsertInstallments(saleId, total_commission, nextSaleDate, null);
     }
   }
 
