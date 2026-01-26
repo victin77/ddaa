@@ -866,7 +866,21 @@ app.put('/api/sales/:id/installments', auth(), async (req, res) => {
   const installments = req.body?.installments;
   if (!Array.isArray(installments)) return res.status(400).json({ error: 'missing_installments' });
 
-  await upsertInstallments(saleId, existing.total_commission, existing.sale_date, installments);
+  let finalInstallments = installments;
+  if (role !== 'admin') {
+    // Consultants can mark paid/pending but can't set "bill_overdue". Preserve existing flags.
+    const existingIts = await db.all('SELECT number, bill_overdue FROM installments WHERE sale_id=?', [saleId]);
+    const billMap = new Map(existingIts.map(x => [Number(x.number), Number(x.bill_overdue || 0) ? 1 : 0]));
+
+    finalInstallments = installments.map((it) => {
+      const n = Number(it.number);
+      const isPaid = String(it.status || '') === 'paid' || !!it.paid_date;
+      const existingBill = billMap.get(n) ? 1 : 0;
+      return { ...it, bill_overdue: isPaid ? 0 : existingBill };
+    });
+  }
+
+  await upsertInstallments(saleId, existing.total_commission, existing.sale_date, finalInstallments);
   const its = await db.all('SELECT number,value,due_date,status,bill_overdue,paid_date FROM installments WHERE sale_id=? ORDER BY number', [saleId]);
   res.json({
     ok: true,
