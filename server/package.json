@@ -2,6 +2,8 @@
   "name": "racon-server",
   "version": "0.1.0",
   "private": true,
+  "license": "UNLICENSED",
+  "author": "Victor Cauã Botelho Generoso da Silva",
   "scripts": {
     "dev": "tsx watch --no-warnings src/index.ts",
     "build": "tsc -p tsconfig.json",

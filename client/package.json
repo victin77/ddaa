@@ -1,6 +1,8 @@
 {
   "name": "racon-client",
   "private": true,
+  "license": "UNLICENSED",
+  "author": "Victor Cauã Botelho Generoso da Silva",
   "version": "0.1.0",
   "type": "module",
   "scripts": {
