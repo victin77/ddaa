@@ -5,10 +5,14 @@
   "scripts": {
     "dev": "concurrently -n server,client -c blue,magenta \"npm --prefix server run dev\" \"npm --prefix client run dev\"",
     "install:all": "npm install && npm --prefix server install && npm --prefix client install",
+    "postinstall": "npm --prefix server install --include=dev && npm --prefix client install --include=dev",
     "build": "npm --prefix server run build && npm --prefix client run build",
     "start": "npm --prefix server start"
   },
   "devDependencies": {
     "concurrently": "^8.2.2"
+  },
+  "engines": {
+    "node": ">=24"
   }
 }
