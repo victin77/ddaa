@@ -6,14 +6,8 @@ import { tierFor } from '../utils/tiers';
 
 const router = Router();
 
-router.get('/summary', requireAuth, (req, res) => {
+router.get('/summary', requireAuth, async (req, res) => {
   const isAdmin = req.user!.role === 'admin';
-  const params: any[] = [];
-  let where = '';
-  if (!isAdmin) {
-    where = 'WHERE consultant_id = ?';
-    params.push(req.user!.consultant_id);
-  }
   const today = dayjs().format('YYYY-MM-DD');
   const monthStart = dayjs().startOf('month').format('YYYY-MM-DD');
   const monthEnd = dayjs().endOf('month').format('YYYY-MM-DD');
@@ -21,82 +15,95 @@ router.get('/summary', requireAuth, (req, res) => {
   const prevMonthEnd = dayjs().subtract(1, 'month').endOf('month').format('YYYY-MM-DD');
   const weekStart = dayjs().subtract(6, 'day').format('YYYY-MM-DD');
 
-  const salesToday = db
-    .prepare(
-      `SELECT COUNT(*) c, COALESCE(SUM(total_commission),0) s FROM sales ${where}${
-        where ? ' AND' : ' WHERE'
-      } sale_date = ?`
-    )
-    .get(...params, today) as { c: number; s: number };
-  const salesWeek = db
-    .prepare(
-      `SELECT COUNT(*) c, COALESCE(SUM(base_value),0) s FROM sales ${where}${
-        where ? ' AND' : ' WHERE'
-      } sale_date >= ?`
-    )
-    .get(...params, weekStart) as { c: number; s: number };
-  const salesMonth = db
-    .prepare(
-      `SELECT COUNT(*) c, COALESCE(SUM(total_commission),0) s, COALESCE(SUM(base_value),0) base FROM sales ${where}${
-        where ? ' AND' : ' WHERE'
-      } sale_date BETWEEN ? AND ?`
-    )
-    .get(...params, monthStart, monthEnd) as { c: number; s: number; base: number };
-  const salesPrevMonth = db
-    .prepare(
-      `SELECT COUNT(*) c, COALESCE(SUM(total_commission),0) s, COALESCE(SUM(base_value),0) base FROM sales ${where}${
-        where ? ' AND' : ' WHERE'
-      } sale_date BETWEEN ? AND ?`
-    )
-    .get(...params, prevMonthStart, prevMonthEnd) as { c: number; s: number; base: number };
+  // Para queries com WHERE consultant_id opcional, usamos um literal NULL e
+  // o filtro só vale quando o consultant_id é passado.
+  const cid = isAdmin ? null : req.user!.consultant_id;
 
-  const installmentBase = isAdmin
-    ? `SELECT i.* FROM installments i`
-    : `SELECT i.* FROM installments i JOIN sales s ON s.id=i.sale_id WHERE s.consultant_id=${req.user!.consultant_id}`;
+  const salesToday = await db.queryOne<{ c: number; s: number }>(
+    `SELECT COUNT(*)::int c, COALESCE(SUM(total_commission),0) s FROM sales
+     WHERE ($1::int IS NULL OR consultant_id=$1) AND sale_date = $2`,
+    [cid, today]
+  );
+  const salesWeek = await db.queryOne<{ c: number; s: number }>(
+    `SELECT COUNT(*)::int c, COALESCE(SUM(base_value),0) s FROM sales
+     WHERE ($1::int IS NULL OR consultant_id=$1) AND sale_date >= $2`,
+    [cid, weekStart]
+  );
+  const salesMonth = await db.queryOne<{ c: number; s: number; base: number }>(
+    `SELECT COUNT(*)::int c, COALESCE(SUM(total_commission),0) s, COALESCE(SUM(base_value),0) base FROM sales
+     WHERE ($1::int IS NULL OR consultant_id=$1) AND sale_date BETWEEN $2 AND $3`,
+    [cid, monthStart, monthEnd]
+  );
+  const salesPrevMonth = await db.queryOne<{ c: number; s: number; base: number }>(
+    `SELECT COUNT(*)::int c, COALESCE(SUM(total_commission),0) s, COALESCE(SUM(base_value),0) base FROM sales
+     WHERE ($1::int IS NULL OR consultant_id=$1) AND sale_date BETWEEN $2 AND $3`,
+    [cid, prevMonthStart, prevMonthEnd]
+  );
 
-  const pending = db
-    .prepare(`SELECT COUNT(*) c, COALESCE(SUM(value),0) s FROM (${installmentBase}) x WHERE x.status='pending'`)
-    .get() as { c: number; s: number };
-  const overdue = db
-    .prepare(`SELECT COUNT(*) c, COALESCE(SUM(value),0) s FROM (${installmentBase}) x WHERE x.status='overdue' OR x.bill_overdue=1`)
-    .get() as { c: number; s: number };
-  const paid = db
-    .prepare(`SELECT COUNT(*) c, COALESCE(SUM(value),0) s FROM (${installmentBase}) x WHERE x.status='paid'`)
-    .get() as { c: number; s: number };
+  const instWhere = isAdmin
+    ? ''
+    : `WHERE s.consultant_id=${Number(req.user!.consultant_id)}`;
+  const instJoin = `FROM installments i JOIN sales s ON s.id=i.sale_id ${instWhere}`;
 
-  const commissionAll = db
-    .prepare(`SELECT COALESCE(SUM(total_commission),0) s FROM sales ${where}`)
-    .get(...params) as { s: number };
+  const pending = await db.queryOne<{ c: number; s: number }>(
+    `SELECT COUNT(*)::int c, COALESCE(SUM(i.value),0) s ${instJoin} ${
+      instWhere ? 'AND' : 'WHERE'
+    } i.status='pending'`
+  );
+  const overdue = await db.queryOne<{ c: number; s: number }>(
+    `SELECT COUNT(*)::int c, COALESCE(SUM(i.value),0) s ${instJoin} ${
+      instWhere ? 'AND' : 'WHERE'
+    } (i.status='overdue' OR i.bill_overdue=1)`
+  );
+  const paid = await db.queryOne<{ c: number; s: number }>(
+    `SELECT COUNT(*)::int c, COALESCE(SUM(i.value),0) s ${instJoin} ${
+      instWhere ? 'AND' : 'WHERE'
+    } i.status='paid'`
+  );
 
-  const targetRow = isAdmin
-    ? (db
-        .prepare(
-          `SELECT COALESCE(SUM(monthly_target),0) t, COUNT(*) c FROM consultants WHERE active=1`
-        )
-        .get() as { t: number; c: number })
-    : (db
-        .prepare(`SELECT COALESCE(monthly_target,0) t FROM consultants WHERE id=?`)
-        .get(req.user!.consultant_id) as { t: number } | undefined) ?? { t: 0 };
-  const targetMonthly = (targetRow as { t: number }).t || 0;
-  const targetAchieved = salesMonth.base || 0;
+  const commissionAll = await db.queryOne<{ s: number }>(
+    `SELECT COALESCE(SUM(total_commission),0) s FROM sales
+     WHERE ($1::int IS NULL OR consultant_id=$1)`,
+    [cid]
+  );
+
+  let targetMonthly = 0;
+  if (isAdmin) {
+    const row = await db.queryOne<{ t: number; c: number }>(
+      'SELECT COALESCE(SUM(monthly_target),0) t, COUNT(*)::int c FROM consultants WHERE active=1'
+    );
+    targetMonthly = row?.t ?? 0;
+  } else {
+    const row = await db.queryOne<{ t: number }>(
+      'SELECT COALESCE(monthly_target,0) t FROM consultants WHERE id=$1',
+      [req.user!.consultant_id]
+    );
+    targetMonthly = row?.t ?? 0;
+  }
+
+  const targetAchieved = salesMonth?.base || 0;
   const targetPct = targetMonthly > 0 ? (targetAchieved / targetMonthly) * 100 : 0;
   const daysLeft = Math.max(0, dayjs().endOf('month').diff(dayjs(), 'day'));
 
   res.json({
-    today: { count: salesToday.c, commission: salesToday.s },
-    week: { count: salesWeek.c, base: salesWeek.s },
-    month: { count: salesMonth.c, commission: salesMonth.s, base: salesMonth.base },
+    today: { count: salesToday?.c ?? 0, commission: salesToday?.s ?? 0 },
+    week: { count: salesWeek?.c ?? 0, base: salesWeek?.s ?? 0 },
+    month: {
+      count: salesMonth?.c ?? 0,
+      commission: salesMonth?.s ?? 0,
+      base: salesMonth?.base ?? 0,
+    },
     prevMonth: {
-      count: salesPrevMonth.c,
-      commission: salesPrevMonth.s,
-      base: salesPrevMonth.base,
+      count: salesPrevMonth?.c ?? 0,
+      commission: salesPrevMonth?.s ?? 0,
+      base: salesPrevMonth?.base ?? 0,
     },
     installments: {
-      paid: { count: paid.c, total: paid.s },
-      pending: { count: pending.c, total: pending.s },
-      overdue: { count: overdue.c, total: overdue.s },
+      paid: { count: paid?.c ?? 0, total: paid?.s ?? 0 },
+      pending: { count: pending?.c ?? 0, total: pending?.s ?? 0 },
+      overdue: { count: overdue?.c ?? 0, total: overdue?.s ?? 0 },
     },
-    totals: { commission: commissionAll.s },
+    totals: { commission: commissionAll?.s ?? 0 },
     target: {
       monthly: targetMonthly,
       achieved: targetAchieved,
@@ -107,30 +114,29 @@ router.get('/summary', requireAuth, (req, res) => {
   });
 });
 
-router.get('/ranking', requireAuth, (req, res) => {
+router.get('/ranking', requireAuth, async (req, res) => {
   const start = (req.query.start as string) || dayjs().startOf('month').format('YYYY-MM-DD');
   const end = (req.query.end as string) || dayjs().endOf('month').format('YYYY-MM-DD');
   const isAdmin = req.user!.role === 'admin';
-  const rows = db
-    .prepare(
-      `SELECT c.id, c.name, c.monthly_target,
-              COALESCE(SUM(s.base_value),0) total_base,
-              COALESCE(SUM(s.total_commission),0) total_commission,
-              COUNT(s.id) sale_count
-       FROM consultants c
-       LEFT JOIN sales s ON s.consultant_id=c.id AND s.sale_date BETWEEN ? AND ?
-       WHERE c.active=1
-       GROUP BY c.id
-       ORDER BY total_base DESC, c.name COLLATE NOCASE`
-    )
-    .all(start, end) as {
+  const rows = await db.queryAll<{
     id: number;
     name: string;
     monthly_target: number;
     total_base: number;
     total_commission: number;
     sale_count: number;
-  }[];
+  }>(
+    `SELECT c.id, c.name, c.monthly_target,
+            COALESCE(SUM(s.base_value),0) total_base,
+            COALESCE(SUM(s.total_commission),0) total_commission,
+            COUNT(s.id)::int sale_count
+       FROM consultants c
+       LEFT JOIN sales s ON s.consultant_id=c.id AND s.sale_date BETWEEN $1 AND $2
+       WHERE c.active=1
+       GROUP BY c.id
+       ORDER BY total_base DESC, LOWER(c.name)`,
+    [start, end]
+  );
 
   const result = rows.map((r) => {
     const tier = tierFor(r.total_base);
@@ -144,7 +150,7 @@ router.get('/ranking', requireAuth, (req, res) => {
   res.json(result);
 });
 
-router.get('/recebimentos', requireAuth, (req, res) => {
+router.get('/recebimentos', requireAuth, async (req, res) => {
   const isAdmin = req.user!.role === 'admin';
   const month = (req.query.month as string) || dayjs().format('YYYY-MM');
   const consultantId = isAdmin
@@ -156,17 +162,15 @@ router.get('/recebimentos', requireAuth, (req, res) => {
   const monthStart = dayjs(`${month}-01`).startOf('month').format('YYYY-MM-DD');
   const monthEnd = dayjs(`${month}-01`).endOf('month').format('YYYY-MM-DD');
 
-  let sql = `SELECT i.*, s.consultant_id, s.consultant_name, s.client_name, s.product
-             FROM installments i
-             JOIN sales s ON s.id = i.sale_id
-             WHERE i.due_date BETWEEN ? AND ?`;
-  const params: any[] = [monthStart, monthEnd];
-  if (consultantId) {
-    sql += ' AND s.consultant_id=?';
-    params.push(consultantId);
-  }
-  sql += ' ORDER BY i.due_date ASC';
-  const rows = db.prepare(sql).all(...params);
+  const rows = await db.queryAll(
+    `SELECT i.*, s.consultant_id, s.consultant_name, s.client_name, s.product
+       FROM installments i
+       JOIN sales s ON s.id = i.sale_id
+      WHERE i.due_date BETWEEN $1 AND $2
+        AND ($3::int IS NULL OR s.consultant_id=$3)
+      ORDER BY i.due_date ASC`,
+    [monthStart, monthEnd, consultantId]
+  );
   res.json(rows);
 });
 

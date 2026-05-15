@@ -1,152 +1,159 @@
-import { DatabaseSync, StatementSync } from 'node:sqlite';
-import path from 'path';
-import fs from 'fs';
+import { Pool, PoolClient, types } from 'pg';
 import bcrypt from 'bcryptjs';
 
-const dataDir = path.resolve(__dirname, '..', 'data');
-if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+types.setTypeParser(20, (v) => parseInt(v, 10));
+types.setTypeParser(1700, (v) => parseFloat(v));
+types.setTypeParser(1082, (v) => v);
 
-const raw = new DatabaseSync(path.join(dataDir, 'data.sqlite'));
-raw.exec('PRAGMA journal_mode = WAL;');
-raw.exec('PRAGMA foreign_keys = ON;');
-
-function normalizeValue(v: any): any {
-  if (typeof v === 'bigint') return Number(v);
-  return v;
+const connectionString = process.env.DATABASE_URL;
+if (!connectionString) {
+  throw new Error('DATABASE_URL não definido. Configure em server/.env');
 }
 
-function normalizeRow<T = any>(row: any): T | undefined {
-  if (!row) return row;
-  const out: any = {};
-  for (const k of Object.keys(row)) out[k] = normalizeValue(row[k]);
-  return out as T;
-}
+const isLocal = /localhost|127\.0\.0\.1/.test(connectionString);
+
+export const pool = new Pool({
+  connectionString,
+  ssl: isLocal ? false : { rejectUnauthorized: false },
+});
 
 interface RunResult {
-  changes: number;
-  lastInsertRowid: number;
+  rowCount: number;
+  rows: any[];
 }
 
-interface Stmt {
-  get<T = any>(...params: any[]): T | undefined;
-  all<T = any>(...params: any[]): T[];
-  run(...params: any[]): RunResult;
+export interface DbApi {
+  queryOne<T = any>(sql: string, params?: any[]): Promise<T | undefined>;
+  queryAll<T = any>(sql: string, params?: any[]): Promise<T[]>;
+  queryRun(sql: string, params?: any[]): Promise<RunResult>;
+  exec(sql: string): Promise<void>;
 }
 
-function wrap(s: StatementSync): Stmt {
+function makeApi(exec: (sql: string, params?: any[]) => Promise<{ rows: any[]; rowCount: number | null }>): DbApi {
   return {
-    get(...params: any[]) {
-      const row = s.get(...(params as any));
-      return normalizeRow(row);
+    async queryOne(sql, params = []) {
+      const r = await exec(sql, params);
+      return r.rows[0];
     },
-    all(...params: any[]) {
-      const rows = s.all(...(params as any));
-      return rows.map((r: any) => normalizeRow(r)!);
+    async queryAll(sql, params = []) {
+      const r = await exec(sql, params);
+      return r.rows;
     },
-    run(...params: any[]) {
-      const r = s.run(...(params as any));
-      return {
-        changes: Number(r.changes),
-        lastInsertRowid: Number(r.lastInsertRowid),
-      };
+    async queryRun(sql, params = []) {
+      const r = await exec(sql, params);
+      return { rowCount: r.rowCount ?? 0, rows: r.rows };
+    },
+    async exec(sql) {
+      await exec(sql);
     },
   };
 }
 
-export const db = {
-  exec: (sql: string) => raw.exec(sql),
-  prepare: (sql: string) => wrap(raw.prepare(sql)),
-  close: () => raw.close(),
-};
+export const db: DbApi = makeApi((sql, params) => pool.query(sql, params));
 
-db.exec(`
+export async function tx<T>(fn: (txDb: DbApi, client: PoolClient) => Promise<T>): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const txDb = makeApi((sql, params) => client.query(sql, params));
+    const result = await fn(txDb, client);
+    await client.query('COMMIT');
+    return result;
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+const SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS consultants (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     name TEXT NOT NULL,
     email TEXT,
-    active INTEGER NOT NULL DEFAULT 1
+    active INTEGER NOT NULL DEFAULT 1,
+    monthly_target DOUBLE PRECISION NOT NULL DEFAULT 0
   );
 
   CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     username TEXT UNIQUE NOT NULL,
     password_hash TEXT NOT NULL,
     role TEXT NOT NULL CHECK (role IN ('admin','consultant')),
-    consultant_id INTEGER,
-    FOREIGN KEY (consultant_id) REFERENCES consultants(id) ON DELETE SET NULL
+    consultant_id INTEGER REFERENCES consultants(id) ON DELETE SET NULL
   );
 
   CREATE TABLE IF NOT EXISTS sales (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    consultant_id INTEGER NOT NULL,
+    id SERIAL PRIMARY KEY,
+    consultant_id INTEGER NOT NULL REFERENCES consultants(id) ON DELETE CASCADE,
     consultant_name TEXT NOT NULL,
     client_number TEXT,
     client_name TEXT NOT NULL,
     product TEXT NOT NULL,
-    sale_date TEXT NOT NULL,
+    sale_date DATE NOT NULL,
     insurance INTEGER NOT NULL DEFAULT 0,
-    base_value REAL NOT NULL DEFAULT 0,
+    base_value DOUBLE PRECISION NOT NULL DEFAULT 0,
     quotas INTEGER NOT NULL DEFAULT 1,
-    unit_value REAL NOT NULL DEFAULT 0,
-    commission_percentage REAL NOT NULL DEFAULT 0.8,
-    total_commission REAL NOT NULL DEFAULT 0,
+    unit_value DOUBLE PRECISION NOT NULL DEFAULT 0,
+    commission_percentage DOUBLE PRECISION NOT NULL DEFAULT 0.8,
+    total_commission DOUBLE PRECISION NOT NULL DEFAULT 0,
     group_quota TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    FOREIGN KEY (consultant_id) REFERENCES consultants(id) ON DELETE CASCADE
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
 
-  CREATE TRIGGER IF NOT EXISTS trg_sales_updated
-  AFTER UPDATE ON sales FOR EACH ROW BEGIN
-    UPDATE sales SET updated_at = datetime('now') WHERE id = OLD.id;
-  END;
+  CREATE OR REPLACE FUNCTION trg_set_updated_at() RETURNS trigger LANGUAGE plpgsql AS $$
+  BEGIN NEW.updated_at = NOW(); RETURN NEW; END;
+  $$;
+
+  DROP TRIGGER IF EXISTS trg_sales_updated ON sales;
+  CREATE TRIGGER trg_sales_updated BEFORE UPDATE ON sales
+  FOR EACH ROW EXECUTE FUNCTION trg_set_updated_at();
 
   CREATE TABLE IF NOT EXISTS installments (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    sale_id INTEGER NOT NULL,
+    id SERIAL PRIMARY KEY,
+    sale_id INTEGER NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
     number INTEGER NOT NULL,
-    value REAL NOT NULL,
-    due_date TEXT NOT NULL,
+    value DOUBLE PRECISION NOT NULL,
+    due_date DATE NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('paid','pending','overdue')),
     bill_overdue INTEGER NOT NULL DEFAULT 0,
-    paid_date TEXT,
-    FOREIGN KEY (sale_id) REFERENCES sales(id) ON DELETE CASCADE
+    paid_date DATE
   );
 
   CREATE TABLE IF NOT EXISTS sale_quotas (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    sale_id INTEGER NOT NULL,
+    id SERIAL PRIMARY KEY,
+    sale_id INTEGER NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
     number INTEGER NOT NULL,
-    value REAL NOT NULL,
-    FOREIGN KEY (sale_id) REFERENCES sales(id) ON DELETE CASCADE
+    value DOUBLE PRECISION NOT NULL
   );
 
   CREATE INDEX IF NOT EXISTS idx_sales_consultant ON sales(consultant_id);
   CREATE INDEX IF NOT EXISTS idx_sales_date ON sales(sale_date);
   CREATE INDEX IF NOT EXISTS idx_installments_sale ON installments(sale_id);
   CREATE INDEX IF NOT EXISTS idx_quotas_sale ON sale_quotas(sale_id);
-`);
+`;
 
-// Migrations (idempotent)
-function ensureColumn(table: string, column: string, definition: string) {
-  const cols = db
-    .prepare(`PRAGMA table_info(${table})`)
-    .all() as { name: string }[];
-  if (!cols.some((c) => c.name === column)) {
-    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+export async function initDb(): Promise<void> {
+  await pool.query(SCHEMA_SQL);
+
+  const adminUsername = process.env.ADMIN_USERNAME || 'admin';
+  const adminPassword = process.env.ADMIN_PASSWORD || 'admin';
+  const existsAdmin = await db.queryOne<{ id: number }>(
+    'SELECT id FROM users WHERE username = $1',
+    [adminUsername]
+  );
+  if (!existsAdmin) {
+    const hash = bcrypt.hashSync(adminPassword, 10);
+    await db.queryRun(
+      'INSERT INTO users (username, password_hash, role, consultant_id) VALUES ($1,$2,$3,$4)',
+      [adminUsername, hash, 'admin', null]
+    );
+    console.log(`[db] admin user created: ${adminUsername}`);
   }
 }
-ensureColumn('consultants', 'monthly_target', 'REAL NOT NULL DEFAULT 0');
-ensureColumn('sales', 'group_quota', 'TEXT');
 
-// Seed admin
-const adminUsername = process.env.ADMIN_USERNAME || 'admin';
-const adminPassword = process.env.ADMIN_PASSWORD || 'admin';
-const existsAdmin = db.prepare('SELECT id FROM users WHERE username = ?').get(adminUsername);
-if (!existsAdmin) {
-  const hash = bcrypt.hashSync(adminPassword, 10);
-  db.prepare(
-    'INSERT INTO users (username, password_hash, role, consultant_id) VALUES (?,?,?,?)'
-  ).run(adminUsername, hash, 'admin', null);
-  console.log(`[db] admin user created: ${adminUsername}`);
+export async function closeDb(): Promise<void> {
+  await pool.end();
 }

@@ -5,7 +5,7 @@ import cors from 'cors';
 import path from 'path';
 import fs from 'fs';
 
-import './db';
+import { initDb } from './db';
 import authRoutes from './routes/auth';
 import publicRoutes from './routes/public';
 import consultantRoutes from './routes/consultants';
@@ -48,6 +48,13 @@ if (fs.existsSync(clientDist)) {
   });
 }
 
-app.listen(PORT, () => {
-  console.log(`[racon] api on http://localhost:${PORT}`);
-});
+initDb()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`[racon] api on http://localhost:${PORT}`);
+    });
+  })
+  .catch((e) => {
+    console.error('[racon] falha ao inicializar DB:', e);
+    process.exit(1);
+  });
