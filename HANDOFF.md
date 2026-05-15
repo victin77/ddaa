@@ -1,60 +1,91 @@
 # Handoff — próxima sessão
 
-## Status: todas as tarefas do handoff anterior foram concluídas (sessão 2026-05-13)
+## Status atual: migração SQLite → Postgres (Railway) em 2026-05-15
 
-### Resumo das correções aplicadas
+### Por que migramos
+O sistema usava `node:sqlite` com o arquivo `server/data/data.sqlite` dentro do container do Railway. Como Railway free tier (sem volume) tem **filesystem efêmero**, qualquer `git push` que disparava redeploy zerava o banco. Foi isso que apagou as 88 vendas importadas via Excel.
 
-**1. Tooltip "torto" no Cash Flow** ✅
-- Causa raiz: `anim-pop` (keyframes `scaleIn`) aplicava `transform: scale(1)` no final, sobrescrevendo o `-translate-x-1/2` do Tailwind no mesmo elemento.
-- Fix: wrapping em dois divs — o externo cuida do posicionamento (`left:50%` + `translateX(-50%)`), o interno aplica o `anim-pop`. Sem conflito de transforms. `client/src/components/Charts.tsx` ~278-298
+A solução foi migrar pro Postgres gerenciado do próprio Railway — os dados ficam num serviço separado que persiste entre deploys.
 
-**2. Toggle Semana/Ano/Mês quebrado** ✅
-- Causa: `100/n %` em `left` não batia com `padding p-1` do container e com botões que tinham largura definida pelo conteúdo (não `flex-1`).
-- Fix: botões agora têm `flex-1` (largura igual). Indicador usa `width: calc((100% - 8px) / n)` e `transform: translateX(index * 100%)` — math direto, sem percentuais relativos a container externo. `client/src/components/Charts.tsx` ~193-220
+### O que mudou tecnicamente
 
-**3. Opção "Mês"** ✅
-- Adicionado tipo `'weekly' | 'monthly' | 'yearly'` (antes era `'monthly' | 'yearly'` com `monthly` significando semanal — confuso, renomeado).
-- `weekly`: últimos 7 dias (uma barra por dia).
-- `monthly` (novo): últimas 4 semanas agrupadas (Sem 1..Sem 4).
-- `yearly`: últimos 12 meses.
-- `client/src/pages/Dashboard.tsx` ~36, ~55-95
+**Stack do banco:**
+- Antes: `node:sqlite` (síncrono, arquivo local)
+- Agora: `pg` (Pool, async, conexão remota via `DATABASE_URL`)
 
-**4. Hover dos gráficos suavizado** ✅
-- Donut: opacity/filter agora animam em 420ms com `cubic-bezier(0.22,1,0.36,1)`, fatia ativa ganha `scale(1.06)` + `drop-shadow` laranja sutil.
-- Cash Flow: barras agora têm crossfade entre estado default e highlighted (duas barras sobrepostas com `opacity + scale-y` animando em 500ms).
+**`server/src/db.ts` reescrito:**
+- Exporta API async: `db.queryOne / queryAll / queryRun / exec`
+- Helper `tx(fn)` pra transações (usado em `wipe-all`, `wipe-sales`, seed `--reset`)
+- `initDb()` cria todas as tabelas (idempotente, `CREATE TABLE IF NOT EXISTS`) + seed do admin
+- Type parsers configurados pra retornar `BIGINT`→number, `NUMERIC`→number, `DATE`→string YYYY-MM-DD (mantém compatível com frontend que esperava strings)
+- SSL automático: se `DATABASE_URL` não for `localhost`, usa SSL `rejectUnauthorized:false` (Railway exige)
 
-**5. Filtro por data em /vendas** ✅
-- Pílulas rápidas: Hoje, 7 dias, 30 dias, Este mês.
-- Dois inputs `<input type="date">` para range customizado.
-- Sincronização com URL params `?start=&end=`.
-- Filtro client-side no `useMemo filtered`.
-- `client/src/pages/Sales.tsx`
+**Schema em sintaxe Postgres** (`SCHEMA_SQL` em `db.ts`):
+- `SERIAL` no lugar de `INTEGER PRIMARY KEY AUTOINCREMENT`
+- `DOUBLE PRECISION` no lugar de `REAL`
+- `DATE` no lugar de `TEXT` (com type parser pra continuar string no driver)
+- Trigger `BEFORE UPDATE` em `sales` pra `updated_at` (função `trg_set_updated_at`)
+- Foreign keys com `ON DELETE CASCADE/SET NULL` inline
 
-**6 + 7. Tema claro com ripple** ✅
-- Sistema baseado em CSS variables: `--bg-rgb`, `--bg-card-rgb`, `--bg-elev-rgb`, `--ink-rgb`, `--muted-rgb`, `--overlay-rgb`, etc. em `:root` (dark, default) e `html.light` (light).
-- Tailwind config refatorado para consumir vars via `rgb(var(--X) / <alpha-value>)`.
-- Todas as ocorrências de `bg-white/[…]` e `border-white/[…]` foram substituídas por `bg-overlay/[…]` / `border-overlay/[…]`, que adaptam automaticamente.
-- `text-white` mantido apenas em contextos sobre accent (orange) — demais migrados para `text-ink`.
-- `ThemeContext` em `client/src/contexts/ThemeContext.tsx` usa `document.startViewTransition` + clip-path circular animado a partir das coordenadas do clique no botão (efeito iOS 18).
-- Toggle Sol/Lua no header (Layout) — passa `{ x: e.clientX, y: e.clientY }`.
-- Persistência em `localStorage` key `racon_theme`; respeita `prefers-color-scheme` no primeiro load; respeita `prefers-reduced-motion`.
-- `client/src/styles/index.css` define keyframes `theme-ripple-in` e estilos `::view-transition-old/new(root)`.
+**Routes (todos os 6 arquivos) e `seed.ts`:**
+- Convertidos pra `async/await`
+- Placeholders `?` → `$1, $2, $3...`
+- `info.lastInsertRowid` → `INSERT ... RETURNING id` + `r.rows[0].id`
+- `COLLATE NOCASE` → `LOWER(coluna)` em ORDER BY
+- Funções SQLite-only convertidas: `date('now')` → `CURRENT_DATE`, `datetime('now')` → `NOW()`, `date(x, '+5 days')` → `x + INTERVAL '5 days'`, `abs(random()) % 5` → `floor(random()*5)::int`, `date('now','start of month')` → `date_trunc('month', CURRENT_DATE)`
+- `index.ts` agora espera `initDb()` resolver antes de chamar `app.listen()`
 
-## Próximos passos sugeridos (livres)
+### Como rodar local
 
-- Validar visualmente o tema claro em todas as páginas (Dashboard, Vendas, Ranking, Consultores, Configurações, Login, Modais). Pode haver sombras ou cores hardcoded em algum componente solitário que escapou.
-- Testar o ripple no Safari/Firefox — `startViewTransition` ainda é Chromium-only; já tem fallback graceful.
-- A bolinha indicadora da tooltip do Cash Flow (`bg-white` no centro com borda accent) some no tema claro porque card também é branco; considerar trocar para `bg-bg-card` ou `bg-ink` se ficar feio.
-- Code-split do bundle (warning do Vite: `> 500kB`). Considerar `lazy()` nas páginas Vendas/Ranking/Consultores/Settings.
+`server/.env` precisa ter `DATABASE_URL=postgresql://...` apontando pra um Postgres acessível (atualmente o público do Railway).
 
-## Como rodar
 ```bash
 cd C:\Users\Vitor\Desktop\racon-comissoes
-npm run dev   # backend 4000 + frontend 5173
+npm run dev
+# backend conecta no Railway Postgres, frontend em localhost:5173
 ```
 
-## Estado da stack
-- Backend: TypeScript + Express + `node:sqlite` em Node 24 (sem deps nativas)
+Seed:
+```bash
+npm --prefix server run seed            # popula se vazio
+npm --prefix server run seed -- --reset # zera e regenera
+```
+
+### O que falta fazer (operacional)
+
+1. **Configurar `DATABASE_URL` no Railway no serviço do app**:
+   - No painel, no serviço do app, Variables → adicionar `DATABASE_URL` com `${{Postgres.DATABASE_URL}}` (referência interna ao serviço Postgres).
+2. **Deploy** (git push) e re-importar o Excel das 88 vendas no sistema online. Daqui pra frente persiste.
+3. **Rotacionar a senha do Postgres** depois que estabilizar (painel do Railway tem "Reset password" no serviço Postgres). A URL atual foi compartilhada no chat de desenvolvimento.
+
+### Sugestão pra futuro: migrar pra Prisma
+
+Hoje usamos `pg` puro — SQL escrito à mão com `$1, $2`. Funciona, mas perde uma camada que o time já usa em outro projeto (CRM Leads). Se o sistema crescer, vale considerar Prisma:
+
+**Vantagens:**
+- Types autogerados do schema (sem precisar manter `types.ts` em sincronia manualmente)
+- Migrations versionadas (`prisma migrate`) em vez de `CREATE TABLE IF NOT EXISTS` no código
+- Consultas com autocomplete e relações tipadas
+- Mesmo padrão do CRM Leads — facilita manter os dois projetos
+
+**Custo da migração:**
+- Reescrever todas as queries (~42) no DSL do Prisma
+- Adicionar `prisma/schema.prisma` espelhando o schema atual
+- `npx prisma migrate dev --name init` na primeira vez pra criar o estado inicial
+- Refatorar `db.ts` pra exportar `PrismaClient` no lugar do Pool
+
+Estimativa: 1-2 sessões de trabalho. Não é urgente — a stack atual está sólida e o ganho seria de DX e consistência entre projetos.
+
+### Outras pendências / sugestões herdadas
+
+- `xlsx` tem 1 vulnerabilidade `high` reportada pelo `npm audit` sem fix do mantenedor. Pra eliminar, considerar trocar por `exceljs`.
+- Code-split do bundle do client (warning do Vite: `> 500kB`). `lazy()` nas páginas Vendas/Ranking/Consultores/Settings.
+- Validar visualmente o tema claro em todas as páginas (Dashboard, Vendas, Ranking, Consultores, Configurações, Login, Modais).
+- Testar o ripple (toggle de tema) no Safari/Firefox — `startViewTransition` ainda é Chromium-only; já tem fallback graceful.
+- A bolinha indicadora da tooltip do Cash Flow (`bg-white` no centro com borda accent) some no tema claro porque card também é branco; considerar trocar para `bg-bg-card` ou `bg-ink` se ficar feio.
+
+### Estado da stack (atualizado)
+- Backend: TypeScript + Express + **`pg` (Postgres Pool)** em Node 24
 - Frontend: Vite + React + Tailwind 3.4 + Recharts + lucide-react
-- Banco: `server/data/data.sqlite` semeado via `npm --prefix server run seed`
+- Banco: **Postgres gerenciado pelo Railway** (sem mais `data.sqlite` no repo)
 - Login default: `admin / admin`

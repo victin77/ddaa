@@ -13,30 +13,31 @@ import { requireAuth } from '../middleware';
 
 const router = Router();
 
-router.post('/login', (req, res) => {
+router.post('/login', async (req, res) => {
   const { username, password } = req.body as { username?: string; password?: string };
   if (!username || !password) return res.status(400).json({ error: 'missing credentials' });
 
-  let userRow = db
-    .prepare('SELECT * FROM users WHERE username = ?')
-    .get(username) as UserRow | undefined;
+  let userRow = await db.queryOne<UserRow>(
+    'SELECT * FROM users WHERE username = $1',
+    [username]
+  );
 
   // Auto-provision login pra consultor se houver senha em env
   if (!userRow) {
-    const consultant = db
-      .prepare("SELECT * FROM consultants WHERE LOWER(name)=LOWER(?) OR LOWER(name)=LOWER(?)")
-      .get(username, username.replace(/\s+/g, ' ')) as ConsultantRow | undefined;
+    const consultant = await db.queryOne<ConsultantRow>(
+      'SELECT * FROM consultants WHERE LOWER(name)=LOWER($1) OR LOWER(name)=LOWER($2)',
+      [username, username.replace(/\s+/g, ' ')]
+    );
     if (consultant) {
       const expected = resolveConsultantPassword(username, consultant.id);
       if (expected === password) {
         const hash = hashPassword(password);
-        const info = db
-          .prepare(
-            'INSERT INTO users (username, password_hash, role, consultant_id) VALUES (?,?,?,?)'
-          )
-          .run(username, hash, 'consultant', consultant.id);
+        const r = await db.queryRun(
+          'INSERT INTO users (username, password_hash, role, consultant_id) VALUES ($1,$2,$3,$4) RETURNING id',
+          [username, hash, 'consultant', consultant.id]
+        );
         userRow = {
-          id: Number(info.lastInsertRowid),
+          id: r.rows[0].id,
           username,
           password_hash: hash,
           role: 'consultant',
