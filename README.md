@@ -1,10 +1,15 @@
 # RACON — Painel de Comissões
 
-Dashboard interno em TypeScript para a equipe comercial da RACON cadastrar vendas, calcular comissões parceladas, acompanhar inadimplência (boleto atrasado / fase de cancelamento), gamificar o ranking e importar/exportar planilhas Excel.
+> **Software proprietário.** Todos os direitos reservados.
+> Copyright © 2026 Victor Cauã Botelho Generoso da Silva. Veja [`LICENSE`](./LICENSE).
+> Este código é publicado em repositório público apenas para fins de portfólio.
+> **Nenhum uso, cópia, modificação ou redistribuição é autorizado sem permissão expressa, prévia e por escrito do autor.**
+
+Dashboard em TypeScript para cadastrar vendas de consórcio, calcular comissões parceladas, acompanhar inadimplência (boleto atrasado / fase de cancelamento), gamificar o ranking e importar/exportar planilhas Excel.
 
 ## Stack
 
-- **Backend** Node + Express + TypeScript + better-sqlite3 + JWT (cookie HTTP-only) + bcrypt + xlsx
+- **Backend** Node 24 + Express + TypeScript + `node:sqlite` (módulo nativo, sem deps nativas) + JWT (cookie HTTP-only) + bcrypt + xlsx
 - **Frontend** Vite + React + TypeScript + Tailwind CSS + Recharts + lucide-react
 - **DB** SQLite local em `server/data/data.sqlite` (criado automaticamente)
 
@@ -86,3 +91,16 @@ racon-comissoes/
         ├── components/{Layout,KpiCard,Charts,Modal,StatusPill,fuzzy}.tsx
         └── pages/{Login,Dashboard,Sales,SaleFormModal,SaleDetailsModal,Ranking,Consultants,Settings}.tsx
 ```
+
+## Licença
+
+Software proprietário. **Todos os direitos reservados** a Victor Cauã Botelho
+Generoso da Silva. Veja [`LICENSE`](./LICENSE) para os termos completos
+(versão em português e em inglês).
+
+A visualização pública deste repositório **não autoriza** uso, cópia,
+modificação, redistribuição ou exploração comercial do código por terceiros.
+Qualquer uso requer autorização expressa, prévia e por escrito do autor.
+
+Amparado pela Lei nº 9.610/1998 (Lei de Direitos Autorais) e Lei nº 9.609/1998
+(Lei do Software).
